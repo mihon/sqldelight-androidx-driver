@@ -45,23 +45,28 @@ internal class AndroidxSqliteExecutingDriver(
   override suspend fun <R> dispatch(transaction: suspend () -> R) =
     when(val enclosing = currentCoroutineContext()[TransactionElement]) {
       null -> {
-        val writer = connectionPool.acquireWriterConnection()
-        // The Transaction's endTransaction path releases the writer once BEGIN IMMEDIATE succeeds.
-        // Before that — e.g. a cancellation during the dispatcher switch, a throw before the
-        // runBlocking coroutine is set up, or BEGIN IMMEDIATE itself throwing — the release is
-        // owned by this call site. released=true suppresses the fallback once ownership transfers
-        // to the Transaction.
-        var released = false
-        try {
-          startTransactionCoroutine(
-            writeConnection = writer,
-            block = transaction,
-            onTransactionStarted = { released = true },
-          )
-        }
-        finally {
-          if(!released) {
-            withContext(NonCancellable) {
+        val currentContext = currentCoroutineContext()
+        // Wrap acquire/release in NonCancellable to prevent CancellationException from deadlocking
+        // the mutex. currentContext is restored inside so the transaction body remains cancellable.
+        withContext(NonCancellable) {
+          val writer = connectionPool.acquireWriterConnection()
+          // The Transaction's endTransaction path releases the writer once BEGIN IMMEDIATE succeeds.
+          // Before that — e.g. a cancellation during the dispatcher switch, a throw before the
+          // runBlocking coroutine is set up, or BEGIN IMMEDIATE itself throwing — the release is
+          // owned by this call site. released=true suppresses the fallback once ownership transfers
+          // to the Transaction.
+          var released = false
+          try {
+            withContext(currentContext) {
+              startTransactionCoroutine(
+                writeConnection = writer,
+                block = transaction,
+                onTransactionStarted = { released = true },
+              )
+            }
+          }
+          finally {
+            if(!released) {
               connectionPool.releaseWriterConnection()
             }
           }
@@ -108,11 +113,27 @@ internal class AndroidxSqliteExecutingDriver(
       ).also {
         activeTransaction = it
       }
-      // Past this point the Transaction owns the writer release via endTransaction.
-      onTransactionStarted()
 
-      withContext(dispatcher + TransactionElement(transaction = transaction)) {
-        block()
+      // If CancellationException fires before block() starts, endTransaction is never called;
+      // release manually. Once blockStarted=true, endTransaction handles cleanup.
+      var blockStarted = false
+      try {
+        withContext(dispatcher + TransactionElement(transaction = transaction)) {
+          blockStarted = true
+          // Past this point the Transaction owns the writer release via endTransaction.
+          onTransactionStarted()
+          block()
+        }
+      } catch(t: Throwable) {
+        if(!blockStarted) {
+          try {
+            writeConnection.execSQL("ROLLBACK")
+          } catch(_: Throwable) {}
+          withContext(NonCancellable) {
+            activeTransaction = null
+          }
+        }
+        throw t
       }
     }
   }
@@ -311,19 +332,23 @@ internal class AndroidxSqliteExecutingDriver(
 
   private suspend inline fun <R> withConnection(
     isWrite: Boolean,
-    block: SQLiteConnection.() -> R,
+    crossinline block: suspend SQLiteConnection.() -> R,
   ): R = when(val transaction = currentCoroutineContext()[TransactionElement]) {
     null -> {
-      val connection = when {
-        isWrite -> connectionPool.acquireWriterConnection()
-        else -> connectionPool.acquireReaderConnection()
-      }
-
-      try {
-        connection.block()
-      }
-      finally {
-        withContext(NonCancellable) {
+      val currentContext = currentCoroutineContext()
+      // Wrap acquire/release in NonCancellable to prevent CancellationException from deadlocking
+      // the mutex. currentContext is restored so the query body remains cancellable.
+      withContext(NonCancellable) {
+        val connection = when {
+          isWrite -> connectionPool.acquireWriterConnection()
+          else -> connectionPool.acquireReaderConnection()
+        }
+        try {
+          withContext(currentContext) {
+            connection.block()
+          }
+        }
+        finally {
           when {
             isWrite -> connectionPool.releaseWriterConnection()
             else -> connectionPool.releaseReaderConnection(connection)
